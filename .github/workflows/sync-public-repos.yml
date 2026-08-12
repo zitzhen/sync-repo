@@ -1,0 +1,133 @@
+name: Sync public repositories
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-public-repos
+  cancel-in-progress: false
+
+env:
+  SOURCE_ORG: zitzhen
+  GITEE_ORG: zitzhen
+  GITLAB_ORG: zitzhen
+  SKIP_REPOS: sync-repo
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync GitHub public repositories to mirrors
+        env:
+          GH_TOKEN: ${{ secrets.GH_PUBLIC_REPO_TOKEN || github.token }}
+          GITEE_USERNAME: ${{ secrets.GITEE_USERNAME }}
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITLAB_USERNAME: ${{ secrets.GITLAB_USERNAME }}
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          GITLAB_HOST: ${{ vars.GITLAB_HOST || 'gitlab.com' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          require_secret() {
+            local name="$1"
+            local value="$2"
+            if [[ -z "$value" ]]; then
+              echo "::error::$name is required"
+              exit 1
+            fi
+          }
+
+          require_secret "GITEE_USERNAME" "${GITEE_USERNAME:-}"
+          require_secret "GITEE_TOKEN" "${GITEE_TOKEN:-}"
+          require_secret "GITLAB_USERNAME" "${GITLAB_USERNAME:-}"
+          require_secret "GITLAB_TOKEN" "${GITLAB_TOKEN:-}"
+
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global --add safe.directory '*'
+
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf "$tmp_dir"' EXIT
+
+          is_skipped() {
+            local repo="$1"
+            IFS=',' read -ra skipped <<< "${SKIP_REPOS:-}"
+            for item in "${skipped[@]}"; do
+              item="${item//[[:space:]]/}"
+              [[ "$repo" == "$item" ]] && return 0
+            done
+            return 1
+          }
+
+          url_encode() {
+            jq -rn --arg value "$1" '$value | @uri'
+          }
+
+          list_public_repos() {
+            local page=1
+            while :; do
+              local response
+              response="$(curl -fsSL \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/orgs/${SOURCE_ORG}/repos?type=public&per_page=100&page=${page}")"
+
+              local count
+              count="$(jq 'length' <<< "$response")"
+              [[ "$count" == "0" ]] && break
+
+              jq -r '.[] | select(.archived == false) | .name' <<< "$response"
+              page="$((page + 1))"
+            done
+          }
+
+          mirror_push() {
+            local repo="$1"
+            local remote_name="$2"
+            local remote_url="$3"
+
+            echo "Syncing ${SOURCE_ORG}/${repo} to ${remote_name}"
+            if git remote get-url "$remote_name" >/dev/null 2>&1; then
+              git remote set-url "$remote_name" "$remote_url"
+            else
+              git remote add "$remote_name" "$remote_url"
+            fi
+            git push --mirror "$remote_name"
+          }
+
+          mapfile -t repos < <(list_public_repos)
+          if [[ "${#repos[@]}" -eq 0 ]]; then
+            echo "No public repositories found for ${SOURCE_ORG}"
+            exit 0
+          fi
+
+          for repo in "${repos[@]}"; do
+            if is_skipped "$repo"; then
+              echo "Skipping ${SOURCE_ORG}/${repo}"
+              continue
+            fi
+
+            repo_dir="${tmp_dir}/${repo}.git"
+            rm -rf "$repo_dir"
+
+            echo "Cloning ${SOURCE_ORG}/${repo}"
+            git clone --mirror "https://github.com/${SOURCE_ORG}/${repo}.git" "$repo_dir"
+
+            (
+              cd "$repo_dir"
+              gitee_user="$(url_encode "$GITEE_USERNAME")"
+              gitee_token="$(url_encode "$GITEE_TOKEN")"
+              gitlab_user="$(url_encode "$GITLAB_USERNAME")"
+              gitlab_token="$(url_encode "$GITLAB_TOKEN")"
+
+              mirror_push "$repo" "gitee" "https://${gitee_user}:${gitee_token}@gitee.com/${GITEE_ORG}/${repo}.git"
+              mirror_push "$repo" "gitlab" "https://${gitlab_user}:${gitlab_token}@${GITLAB_HOST}/${GITLAB_ORG}/${repo}.git"
+            )
+          done
