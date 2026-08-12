@@ -88,7 +88,7 @@ jobs:
             done
           }
 
-          mirror_push() {
+          sync_push() {
             local repo="$1"
             local remote_name="$2"
             local remote_url="$3"
@@ -99,7 +99,7 @@ jobs:
             else
               git remote add "$remote_name" "$remote_url"
             fi
-            git push --mirror "$remote_name"
+            git push --prune "$remote_name" "+refs/heads/*:refs/heads/*" "+refs/tags/*:refs/tags/*"
           }
 
           mapfile -t repos < <(list_public_repos)
@@ -127,7 +127,7 @@ jobs:
               gitlab_user="$(url_encode "$GITLAB_USERNAME")"
               gitlab_token="$(url_encode "$GITLAB_TOKEN")"
 
-              mirror_push "$repo" "gitee" "https://${gitee_user}:${gitee_token}@gitee.com/${GITEE_ORG}/${repo}.git"
-              mirror_push "$repo" "gitlab" "https://${gitlab_user}:${gitlab_token}@${GITLAB_HOST}/${GITLAB_ORG}/${repo}.git"
+              sync_push "$repo" "gitee" "https://${gitee_user}:${gitee_token}@gitee.com/${GITEE_ORG}/${repo}.git"
+              sync_push "$repo" "gitlab" "https://${gitlab_user}:${gitlab_token}@${GITLAB_HOST}/${GITLAB_ORG}/${repo}.git"
             )
           done

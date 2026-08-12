@@ -32,7 +32,9 @@ GitHub Actions page.
 
 ## Notes
 
-- The workflow mirrors all refs using `git push --mirror`.
+- The workflow syncs branches and tags only. GitHub pull request refs such as
+  `refs/pull/*` are intentionally not pushed because target platforms may reject
+  hidden refs.
 - Archived GitHub repositories are skipped.
 - This repository is skipped by default through `SKIP_REPOS: sync-repo` in
   `.github/workflows/sync-public-repos.yml`.
