@@ -29,6 +29,8 @@ jobs:
     outputs:
       repos: ${{ steps.repos.outputs.repos }}
       count: ${{ steps.repos.outputs.count }}
+      skipped: ${{ steps.repos.outputs.skipped }}
+      skipped_count: ${{ steps.repos.outputs.skipped_count }}
 
     steps:
       - name: Get public repositories
@@ -66,6 +68,7 @@ jobs:
           mapfile -t repos < "$tmp_file"
 
           filtered=()
+          skipped_repos=()
 
           for repo in "${repos[@]}"; do
             skip=false
@@ -81,7 +84,11 @@ jobs:
               fi
             done
 
-            [[ "$skip" == false ]] && filtered+=("$repo")
+            if [[ "$skip" == true ]]; then
+              skipped_repos+=("$repo")
+            else
+              filtered+=("$repo")
+            fi
           done
 
           repos_json="$(
@@ -89,10 +96,18 @@ jobs:
               jq -R -s -c 'split("\n") | map(select(length > 0))'
           )"
 
+          skipped_json="$(
+            printf '%s\n' "${skipped_repos[@]}" |
+              jq -R -s -c 'split("\n") | map(select(length > 0))'
+          )"
+
           echo "repos=${repos_json}" >> "$GITHUB_OUTPUT"
           echo "count=${#filtered[@]}" >> "$GITHUB_OUTPUT"
+          echo "skipped=${skipped_json}" >> "$GITHUB_OUTPUT"
+          echo "skipped_count=${#skipped_repos[@]}" >> "$GITHUB_OUTPUT"
 
           echo "Found ${#filtered[@]} repositories"
+          echo "Ignored ${#skipped_repos[@]} repositories"
 
   # ──────────────────────────────────────────────
   # Gitee · 独立同步 Job
@@ -323,6 +338,8 @@ jobs:
           GITEE_RESULT: ${{ needs.gitee.result }}
           GITLAB_RESULT: ${{ needs.gitlab.result }}
           REPO_COUNT: ${{ needs.prepare.outputs.count }}
+          SKIPPED_COUNT: ${{ needs.prepare.outputs.skipped_count }}
+          SKIPPED_REPOS: ${{ needs.prepare.outputs.skipped }}
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -335,6 +352,9 @@ jobs:
             esac
           }
 
+          skipped_count="${SKIPPED_COUNT:-0}"
+          skipped_repos="${SKIPPED_REPOS:-[]}"
+
           {
             echo "# 🌐 Public repository mirror sync"
             echo
@@ -344,8 +364,20 @@ jobs:
             echo "|---|---|"
             echo "| Source | \`${SOURCE_ORG}\` |"
             echo "| Repositories | ${REPO_COUNT:-0} |"
+            echo "| Ignored public repositories | ${skipped_count} |"
             echo "| Gitee | $(status_icon "$GITEE_RESULT") ${GITEE_RESULT} |"
             echo "| GitLab | $(status_icon "$GITLAB_RESULT") ${GITLAB_RESULT} |"
+            echo
+            echo "## 🚫 Ignored public repositories"
+            echo
+
+            if [[ "$skipped_count" -eq 0 ]]; then
+              echo "No public repositories were ignored."
+            else
+              echo "$skipped_repos" |
+                jq -r '.[] | "- " + .'
+            fi
+
             echo
             echo "## Jobs"
             echo
