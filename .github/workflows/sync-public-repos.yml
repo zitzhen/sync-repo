@@ -16,7 +16,7 @@ env:
   SOURCE_ORG: zitzhen
   GITEE_ORG: zitzhen
   GITLAB_ORG: zitzhen
-  SKIP_REPOS: sync-repo
+  SKIP_REPOS: sync-repo,.github
 
 jobs:
   # ──────────────────────────────────────────────
