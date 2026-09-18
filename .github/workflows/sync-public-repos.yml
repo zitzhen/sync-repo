@@ -19,24 +19,105 @@ env:
   SKIP_REPOS: sync-repo
 
 jobs:
-  sync:
+  # ──────────────────────────────────────────────
+  # Prepare · 获取 GitHub 公开仓库列表
+  # ──────────────────────────────────────────────
+  prepare:
+    name: Prepare repositories
     runs-on: ubuntu-latest
+
+    outputs:
+      repos: ${{ steps.repos.outputs.repos }}
+      count: ${{ steps.repos.outputs.count }}
+
     steps:
-      - name: Sync GitHub public repositories to mirrors
+      - name: Get public repositories
+        id: repos
         env:
           GH_TOKEN: ${{ secrets.GH_PUBLIC_REPO_TOKEN || github.token }}
-          GITEE_USERNAME: ${{ secrets.GITEE_USERNAME }}
-          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
-          GITLAB_USERNAME: ${{ secrets.GITLAB_USERNAME }}
-          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
-          GITLAB_HOST: ${{ vars.GITLAB_HOST || 'gitlab.com' }}
         shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          tmp_file="$(mktemp)"
+          trap 'rm -f "$tmp_file"' EXIT
+
+          page=1
+
+          while :; do
+            response="$(curl -fsSL \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/orgs/${SOURCE_ORG}/repos?type=public&per_page=100&page=${page}")"
+
+            count="$(jq 'length' <<< "$response")"
+            [[ "$count" == "0" ]] && break
+
+            jq -r '
+              .[]
+              | select(.archived == false)
+              | .name
+            ' <<< "$response" >> "$tmp_file"
+
+            page="$((page + 1))"
+          done
+
+          mapfile -t repos < "$tmp_file"
+
+          filtered=()
+
+          for repo in "${repos[@]}"; do
+            skip=false
+
+            IFS=',' read -ra skipped <<< "${SKIP_REPOS:-}"
+
+            for item in "${skipped[@]}"; do
+              item="${item//[[:space:]]/}"
+
+              if [[ "$repo" == "$item" ]]; then
+                skip=true
+                break
+              fi
+            done
+
+            [[ "$skip" == false ]] && filtered+=("$repo")
+          done
+
+          repos_json="$(
+            printf '%s\n' "${filtered[@]}" |
+              jq -R -s -c 'split("\n") | map(select(length > 0))'
+          )"
+
+          echo "repos=${repos_json}" >> "$GITHUB_OUTPUT"
+          echo "count=${#filtered[@]}" >> "$GITHUB_OUTPUT"
+
+          echo "Found ${#filtered[@]} repositories"
+
+  # ──────────────────────────────────────────────
+  # Gitee · 独立同步 Job
+  # ──────────────────────────────────────────────
+  gitee:
+    name: Sync to Gitee
+    needs: prepare
+    runs-on: ubuntu-latest
+
+    env:
+      GITEE_USERNAME: ${{ secrets.GITEE_USERNAME }}
+      GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+
+    steps:
+      - name: Sync repositories
+        shell: bash
+        env:
+          REPOS: ${{ needs.prepare.outputs.repos }}
         run: |
           set -Eeuo pipefail
 
           require_secret() {
             local name="$1"
             local value="$2"
+
             if [[ -z "$value" ]]; then
               echo "::error::$name is required"
               exit 1
@@ -45,89 +126,236 @@ jobs:
 
           require_secret "GITEE_USERNAME" "${GITEE_USERNAME:-}"
           require_secret "GITEE_TOKEN" "${GITEE_TOKEN:-}"
-          require_secret "GITLAB_USERNAME" "${GITLAB_USERNAME:-}"
-          require_secret "GITLAB_TOKEN" "${GITLAB_TOKEN:-}"
 
           git config --global user.name "github-actions[bot]"
-          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
           git config --global --add safe.directory '*'
 
           tmp_dir="$(mktemp -d)"
           trap 'rm -rf "$tmp_dir"' EXIT
 
-          is_skipped() {
-            local repo="$1"
-            IFS=',' read -ra skipped <<< "${SKIP_REPOS:-}"
-            for item in "${skipped[@]}"; do
-              item="${item//[[:space:]]/}"
-              [[ "$repo" == "$item" ]] && return 0
-            done
-            return 1
-          }
+          total=0
+          success=0
+          failed=0
 
-          url_encode() {
-            jq -rn --arg value "$1" '$value | @uri'
-          }
+          gitee_user="$(jq -rn --arg value "$GITEE_USERNAME" '$value | @uri')"
+          gitee_token="$(jq -rn --arg value "$GITEE_TOKEN" '$value | @uri')"
 
-          list_public_repos() {
-            local page=1
-            while :; do
-              local response
-              response="$(curl -fsSL \
-                -H "Accept: application/vnd.github+json" \
-                -H "Authorization: Bearer ${GH_TOKEN}" \
-                -H "X-GitHub-Api-Version: 2022-11-28" \
-                "https://api.github.com/orgs/${SOURCE_ORG}/repos?type=public&per_page=100&page=${page}")"
+          while IFS= read -r repo; do
+            [[ -z "$repo" ]] && continue
 
-              local count
-              count="$(jq 'length' <<< "$response")"
-              [[ "$count" == "0" ]] && break
+            total="$((total + 1))"
 
-              jq -r '.[] | select(.archived == false) | .name' <<< "$response"
-              page="$((page + 1))"
-            done
-          }
-
-          sync_push() {
-            local repo="$1"
-            local remote_name="$2"
-            local remote_url="$3"
-
-            echo "Syncing ${SOURCE_ORG}/${repo} to ${remote_name}"
-            if git remote get-url "$remote_name" >/dev/null 2>&1; then
-              git remote set-url "$remote_name" "$remote_url"
-            else
-              git remote add "$remote_name" "$remote_url"
-            fi
-            git push --prune "$remote_name" "+refs/heads/*:refs/heads/*" "+refs/tags/*:refs/tags/*"
-          }
-
-          mapfile -t repos < <(list_public_repos)
-          if [[ "${#repos[@]}" -eq 0 ]]; then
-            echo "No public repositories found for ${SOURCE_ORG}"
-            exit 0
-          fi
-
-          for repo in "${repos[@]}"; do
-            if is_skipped "$repo"; then
-              echo "Skipping ${SOURCE_ORG}/${repo}"
-              continue
-            fi
+            echo "::group::Gitee · ${repo}"
 
             repo_dir="${tmp_dir}/${repo}.git"
             rm -rf "$repo_dir"
 
-            echo "Cloning ${SOURCE_ORG}/${repo}"
-            git clone --mirror "https://github.com/${SOURCE_ORG}/${repo}.git" "$repo_dir"
+            if git clone --mirror \
+              "https://github.com/${SOURCE_ORG}/${repo}.git" \
+              "$repo_dir"; then
 
-            (
               cd "$repo_dir"
-              gitee_user="$(url_encode "$GITEE_USERNAME")"
-              gitee_token="$(url_encode "$GITEE_TOKEN")"
-              gitlab_user="$(url_encode "$GITLAB_USERNAME")"
-              gitlab_token="$(url_encode "$GITLAB_TOKEN")"
 
-              sync_push "$repo" "gitee" "https://${gitee_user}:${gitee_token}@gitee.com/${GITEE_ORG}/${repo}.git"
-              sync_push "$repo" "gitlab" "https://${gitlab_user}:${gitlab_token}@${GITLAB_HOST}/${GITLAB_ORG}/${repo}.git"
-            )
-          done
+              remote_url="https://${gitee_user}:${gitee_token}@gitee.com/${GITEE_ORG}/${repo}.git"
+
+              if git remote get-url gitee >/dev/null 2>&1; then
+                git remote set-url gitee "$remote_url"
+              else
+                git remote add gitee "$remote_url"
+              fi
+
+              if git push --prune gitee \
+                "+refs/heads/*:refs/heads/*" \
+                "+refs/tags/*:refs/tags/*"; then
+                success="$((success + 1))"
+                echo "✓ ${repo}"
+              else
+                failed="$((failed + 1))"
+                echo "::error::Failed to push ${repo} to Gitee"
+              fi
+            else
+              failed="$((failed + 1))"
+              echo "::error::Failed to clone ${repo}"
+            fi
+
+            echo "::endgroup::"
+          done < <(jq -r '.[]' <<< "$REPOS")
+
+          {
+            echo "## 🦊 Gitee synchronization"
+            echo
+            echo "| Metric | Count |"
+            echo "|---|---:|"
+            echo "| Repositories | ${total} |"
+            echo "| Successful | ${success} |"
+            echo "| Failed | ${failed} |"
+            echo
+            echo "> Source: \`${SOURCE_ORG}\`"
+            echo "> Target: \`${GITEE_ORG}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          [[ "$failed" -eq 0 ]]
+
+  # ──────────────────────────────────────────────
+  # GitLab · 独立同步 Job
+  # ──────────────────────────────────────────────
+  gitlab:
+    name: Sync to GitLab
+    needs: prepare
+    runs-on: ubuntu-latest
+
+    env:
+      GITLAB_USERNAME: ${{ secrets.GITLAB_USERNAME }}
+      GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+      GITLAB_HOST: ${{ vars.GITLAB_HOST || 'gitlab.com' }}
+
+    steps:
+      - name: Sync repositories
+        shell: bash
+        env:
+          REPOS: ${{ needs.prepare.outputs.repos }}
+        run: |
+          set -Eeuo pipefail
+
+          require_secret() {
+            local name="$1"
+            local value="$2"
+
+            if [[ -z "$value" ]]; then
+              echo "::error::$name is required"
+              exit 1
+            fi
+          }
+
+          require_secret "GITLAB_USERNAME" "${GITLAB_USERNAME:-}"
+          require_secret "GITLAB_TOKEN" "${GITLAB_TOKEN:-}"
+
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global --add safe.directory '*'
+
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf "$tmp_dir"' EXIT
+
+          total=0
+          success=0
+          failed=0
+
+          gitlab_user="$(jq -rn --arg value "$GITLAB_USERNAME" '$value | @uri')"
+          gitlab_token="$(jq -rn --arg value "$GITLAB_TOKEN" '$value | @uri')"
+
+          while IFS= read -r repo; do
+            [[ -z "$repo" ]] && continue
+
+            total="$((total + 1))"
+
+            echo "::group::GitLab · ${repo}"
+
+            repo_dir="${tmp_dir}/${repo}.git"
+            rm -rf "$repo_dir"
+
+            if git clone --mirror \
+              "https://github.com/${SOURCE_ORG}/${repo}.git" \
+              "$repo_dir"; then
+
+              cd "$repo_dir"
+
+              remote_url="https://${gitlab_user}:${gitlab_token}@${GITLAB_HOST}/${GITLAB_ORG}/${repo}.git"
+
+              if git remote get-url gitlab >/dev/null 2>&1; then
+                git remote set-url gitlab "$remote_url"
+              else
+                git remote add gitlab "$remote_url"
+              fi
+
+              if git push --prune gitlab \
+                "+refs/heads/*:refs/heads/*" \
+                "+refs/tags/*:refs/tags/*"; then
+                success="$((success + 1))"
+                echo "✓ ${repo}"
+              else
+                failed="$((failed + 1))"
+                echo "::error::Failed to push ${repo} to GitLab"
+              fi
+            else
+              failed="$((failed + 1))"
+              echo "::error::Failed to clone ${repo}"
+            fi
+
+            echo "::endgroup::"
+          done < <(jq -r '.[]' <<< "$REPOS")
+
+          {
+            echo "## 🦊 GitLab synchronization"
+            echo
+            echo "| Metric | Count |"
+            echo "|---|---:|"
+            echo "| Repositories | ${total} |"
+            echo "| Successful | ${success} |"
+            echo "| Failed | ${failed} |"
+            echo
+            echo "> Source: \`${SOURCE_ORG}\`"
+            echo "> Target: \`${GITLAB_ORG}\`"
+            echo "> Host: \`${GITLAB_HOST}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          [[ "$failed" -eq 0 ]]
+
+  # ──────────────────────────────────────────────
+  # Summary · 总览页面
+  # ──────────────────────────────────────────────
+  summary:
+    name: Sync summary
+    if: always()
+    needs:
+      - prepare
+      - gitee
+      - gitlab
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Generate summary
+        env:
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          GITEE_RESULT: ${{ needs.gitee.result }}
+          GITLAB_RESULT: ${{ needs.gitlab.result }}
+          REPO_COUNT: ${{ needs.prepare.outputs.count }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          status_icon() {
+            case "$1" in
+              success) echo "✅" ;;
+              skipped) echo "⏭️" ;;
+              *) echo "❌" ;;
+            esac
+          }
+
+          {
+            echo "# 🌐 Public repository mirror sync"
+            echo
+            echo "## Overview"
+            echo
+            echo "| Item | Result |"
+            echo "|---|---|"
+            echo "| Source | \`${SOURCE_ORG}\` |"
+            echo "| Repositories | ${REPO_COUNT:-0} |"
+            echo "| Gitee | $(status_icon "$GITEE_RESULT") ${GITEE_RESULT} |"
+            echo "| GitLab | $(status_icon "$GITLAB_RESULT") ${GITLAB_RESULT} |"
+            echo
+            echo "## Jobs"
+            echo
+            echo "| Job | Status |"
+            echo "|---|---|"
+            echo "| Prepare | $(status_icon "$PREPARE_RESULT") ${PREPARE_RESULT} |"
+            echo "| Gitee | $(status_icon "$GITEE_RESULT") ${GITEE_RESULT} |"
+            echo "| GitLab | $(status_icon "$GITLAB_RESULT") ${GITLAB_RESULT} |"
+            echo
+            echo "---"
+            echo
+            echo "_Generated by GitHub Actions_"
+          } >> "$GITHUB_STEP_SUMMARY"
