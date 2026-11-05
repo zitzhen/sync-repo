@@ -35,6 +35,10 @@ GitHub Actions page.
 - The workflow syncs branches and tags only. GitHub pull request refs such as
   `refs/pull/*` are intentionally not pushed because target platforms may reject
   hidden refs.
+- GitLab synchronization fetches all Git LFS objects from GitHub and uploads
+  them to GitLab before pushing branches and tags. Git LFS must be enabled for
+  target projects, and the GitLab token must have permission to upload LFS
+  objects.
 - Archived GitHub repositories are skipped.
 - This repository is skipped by default through `SKIP_REPOS: sync-repo` in
   `.github/workflows/sync-public-repos.yml`.
