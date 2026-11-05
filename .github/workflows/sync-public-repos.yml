@@ -279,7 +279,7 @@ jobs:
               cd "$repo_dir"
 
               git fetch origin \
-                "+refs/heads/*:refs/heads/*" \
+                "+refs/heads/*:refs/sync/heads/*" \
                 "+refs/tags/*:refs/tags/*"
 
               remote_url="https://${gitlab_user}:${gitlab_token}@${GITLAB_HOST}/${GITLAB_ORG}/${repo}.git"
@@ -293,7 +293,7 @@ jobs:
               if git lfs fetch --all origin &&
                 git lfs push --all gitlab &&
                 git push --prune gitlab \
-                  "+refs/heads/*:refs/heads/*" \
+                  "+refs/sync/heads/*:refs/heads/*" \
                   "+refs/tags/*:refs/tags/*"; then
                 success="$((success + 1))"
                 echo "✓ ${repo}"
